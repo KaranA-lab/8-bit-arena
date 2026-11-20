@@ -51,6 +51,7 @@ export function GameScreen({ gameId, active, resetKey }: Props) {
     let last = performance.now();
     let k = 4;
     let lastCursor = '';
+    let lastActive = true;
 
     const resize = () => {
       const r = canvas.getBoundingClientRect();
@@ -115,6 +116,7 @@ export function GameScreen({ gameId, active, resetKey }: Props) {
       const dt = Math.min(1 / 30, (now - last) / 1000);
       last = now;
       const L = live.current;
+      if (L.active !== lastActive) { lastActive = L.active; sfx.duckCrowd(!L.active); }
 
       if (L.gameId !== curId) {
         game?.destroy?.();

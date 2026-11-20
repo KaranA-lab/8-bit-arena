@@ -154,6 +154,8 @@ export class Golf implements Game {
   power = 0;
   dir = { x: 1, y: 0 };
   lipped = false;
+  /** seconds the ball ignores moving blockers (after being pinned against a wall) */
+  ghost = 0;
   t = 0;
   time = 0;
   layer: HTMLCanvasElement;
@@ -188,13 +190,55 @@ export class Golf implements Game {
     return this.course.grid[idx(tx, ty)];
   }
 
-  private solidAt(x: number, y: number) {
+  /** Static walls and blocks only. Moving blockers are handled by resolveSliders(). */
+  private wallAt(x: number, y: number) {
     for (const [ox, oy] of [[-R, -R], [R, -R], [-R, R], [R, R]]) {
       const t = this.tileAt(x + ox, y + oy);
       if (t === VOID || t === BLOCK) return true;
     }
-    for (const s of this.course.sliders) if (x + R > s.x && x - R < s.x + s.w && y + R > s.y && y - R < s.y + s.h) return true;
     return false;
+  }
+
+  /**
+   * Ball vs the moving yellow/black blockers. Push the ball out the shortest way, bounce it off
+   * relative to the blocker's own motion, and always send it away faster than the blocker moves,
+   * so it gets knocked clear instead of riding along or sticking. If the blocker pins it against
+   * a wall, the ball briefly slips through rather than jamming.
+   */
+  private resolveSliders() {
+    if (this.ghost > 0) return;
+    const b = this.ball;
+    let hit = false;
+    for (const s of this.course.sliders) {
+      const cx = clamp(b.x, s.x, s.x + s.w), cy = clamp(b.y, s.y, s.y + s.h);
+      const dx = b.x - cx, dy = b.y - cy;
+      const d = Math.hypot(dx, dy);
+      if (d >= R) continue;
+      let nx: number, ny: number, pen: number;
+      if (d > 1e-3) { nx = dx / d; ny = dy / d; pen = R - d; }
+      else {
+        // centre is inside the blocker: leave through the nearest face
+        const l = b.x - s.x, r = s.x + s.w - b.x, t = b.y - s.y, bt = s.y + s.h - b.y;
+        const m = Math.min(l, r, t, bt);
+        if (m === l) { nx = -1; ny = 0; pen = l + R; }
+        else if (m === r) { nx = 1; ny = 0; pen = r + R; }
+        else if (m === t) { nx = 0; ny = -1; pen = t + R; }
+        else { nx = 0; ny = 1; pen = bt + R; }
+      }
+      const px = b.x + nx * (pen + 0.25), py = b.y + ny * (pen + 0.25);
+      if (this.wallAt(px, py)) { this.ghost = 0.35; return; }
+      b.x = px; b.y = py;
+      const closing = (b.vx - s.vx) * nx + (b.vy - s.vy) * ny;
+      if (closing < 0) { b.vx -= 1.75 * closing * nx; b.vy -= 1.75 * closing * ny; }
+      const away = b.vx * nx + b.vy * ny;
+      const minAway = Math.max(0, s.vx * nx + s.vy * ny) + 45;
+      if (away < minAway) { b.vx += (minAway - away) * nx; b.vy += (minAway - away) * ny; }
+      hit = true;
+    }
+    if (hit) {
+      sfx.play('wall');
+      if (this.state === 'aim' || this.state === 'drag') this.state = 'roll';
+    }
   }
 
   // ---------------- static layer ----------------
@@ -338,27 +382,14 @@ export class Golf implements Game {
     this.parts.update(dt); this.pops.update(dt);
     const b = this.ball;
 
+    this.ghost = Math.max(0, this.ghost - dt);
     for (const s of this.course.sliders) {
       const v = s.min + (s.max - s.min) * (0.5 + 0.5 * Math.sin(this.time * s.speed + s.ph));
       const ox = s.x, oy = s.y;
       if (s.axis === 'y') s.y = v; else s.x = v;
       s.vx = (s.x - ox) / Math.max(dt, 1e-4); s.vy = (s.y - oy) / Math.max(dt, 1e-4);
-      if (this.state !== 'sunk' && b.x + R > s.x && b.x - R < s.x + s.w && b.y + R > s.y && b.y - R < s.y + s.h) {
-        if (s.axis === 'y') {
-          const above = b.y < s.y + s.h / 2;
-          b.y = above ? s.y - R - 0.2 : s.y + s.h + R + 0.2;
-          b.vy = s.vy * 1.1;
-          if (this.solidAt(b.x, b.y)) b.y = above ? s.y + s.h + R + 0.2 : s.y - R - 0.2;
-        } else {
-          const left = b.x < s.x + s.w / 2;
-          b.x = left ? s.x - R - 0.2 : s.x + s.w + R + 0.2;
-          b.vx = s.vx * 1.1;
-          if (this.solidAt(b.x, b.y)) b.x = left ? s.x + s.w + R + 0.2 : s.x - R - 0.2;
-        }
-        sfx.play('wall');
-        if (this.state === 'aim' || this.state === 'drag') { this.state = 'roll'; }
-      }
     }
+    if (this.state !== 'sunk' && this.state !== 'splash' && this.state !== 'title') this.resolveSliders();
 
     if (this.state === 'roll') {
       const hc = this.holeCenter();
@@ -383,11 +414,12 @@ export class Golf implements Game {
           }
         } else if (d > 4) this.lipped = false;
         const nx = b.x + b.vx * h;
-        if (this.solidAt(nx, b.y)) { if (Math.abs(b.vx) > 12) sfx.play('wall'); b.vx = -b.vx * 0.72; }
+        if (this.wallAt(nx, b.y)) { if (Math.abs(b.vx) > 12) sfx.play('wall'); b.vx = -b.vx * 0.72; }
         else b.x = nx;
         const ny = b.y + b.vy * h;
-        if (this.solidAt(b.x, ny)) { if (Math.abs(b.vy) > 12) sfx.play('wall'); b.vy = -b.vy * 0.72; }
+        if (this.wallAt(b.x, ny)) { if (Math.abs(b.vy) > 12) sfx.play('wall'); b.vy = -b.vy * 0.72; }
         else b.y = ny;
+        this.resolveSliders();
         if (this.tileAt(b.x, b.y) === WATER) { this.splash(); return; }
       }
       if (Math.hypot(b.vx, b.vy) < 3) {

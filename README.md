@@ -25,8 +25,8 @@ npm run preview    # serve the production build locally
 
 | Game | Controls | Rules |
 |---|---|---|
-| Cricket | Pick right- or left-handed, then click left/right half of the screen, or ← → / A D | Chase a random 25–80 target in 18 balls with 3 wickets. Side-on batsman, mirrored for left-handers. Singles and twos bounce along the outfield; catches fly. Timing gives 6 / 4 / 2 / 1, and perfect timing into the gap is always a six. A deep fielder guards one side each ball: hit the gap, or he fields it for 2, with a catch risk. |
-| Football | Pick a nation (Brazil, Argentina, France, Portugal, Spain, Germany, Italy or England), click a corner of the goal to shoot (or arrows + Space). When you're in goal, click left / middle / right to dive | Alternating penalties, 5 each, then sudden death. Random rival nation in contrasting colours each game. Confetti on your goals and saves. |
+| Cricket | Pick one of the 10 IPL teams (kits in team colours, original pixel badges), then a level (Beginner or Intermediate, ↑ ↓) and right- or left-handed, then click left/right half of the screen, or ← → / A D | Chase a random 25–80 target in 18 balls with 3 wickets. Side-on batsman, mirrored for left-handers. Singles and twos bounce along the outfield, fours roll over the rope and catches fly. Big crowd roars for fours and sixes. TV-style scorebar: score, overs, batter, bowler, speed gun, this over. Timing gives 6 / 4 / 2 / 1. On Beginner, perfect timing into the gap is always a six; Intermediate has a much tighter timing window, quicker bowling and sharper fielders, so sixes have to be earned. A deep fielder guards one side each ball: hit the gap, or he fields it for 2, with a catch risk. |
+| Football | Pick a nation (Brazil, Argentina, France, Portugal, Spain, Germany, Italy or England), click a corner of the goal to shoot (or arrows + Space). When you're in goal, click left / middle / right to dive | Alternating penalties, 5 each, then sudden death. Random rival nation in contrasting colours each game. Every scorer sprints to a corner and celebrates: a knee slide, airplane arms or jumping fist pumps. Confetti on your saves and on winning the shootout. |
 | Mini Golf | Drag back from anywhere and release (works with touch) | Endless seeded courses with walls, sand, water (+1 stroke), blocks and moving blockers. Course number shown top-right. |
 | Badminton | A/D move, W jump, click to swing, mouse over their side to aim. Phone: analog thumbstick (push up to jump), B jump, A swing | Beginner / Intermediate / Extreme bot (speed, reactions, accuracy, smashes and shot placement all scale). First to 5. Jump + hit above your head = smash. Out is out, net is a fault. |
 
@@ -67,5 +67,6 @@ For GitHub Pages under `https://<user>.github.io/<repo>/`, set `base: '/<repo>/'
 ## Notes
 
 - The crowd is drawn procedurally in the Figma colours (plum behind, navy in front) instead of the two static masked layers, so individual fans can jump, wave flags and hold up phone lights.
-- Sound effects are synthesised with WebAudio, so there are no audio files to load.
+- Sound effects are synthesised with WebAudio, so there are no audio files to load. Cricket and football also play a quiet crowd murmur that ducks while the menu is open.
+- IPL team names and colours are used, but not their logos (trademarks). The badges and the "8-Bit Premier League" crest are original pixel art.
 - In dev builds the running game is exposed as `window.__game` for debugging. It's stripped from production builds.

@@ -1,31 +1,47 @@
 import { W, H, type Game, rect, px, line, disc, Particles, Pops, Stands, floodlight, stars, miniPerson, CONFETTI } from '../lib/gfx';
-import { drawText } from '../lib/font';
+import { drawText, measure } from '../lib/font';
 import { panel, blinkText, dim } from '../lib/ui';
-import { C, clamp, lerp, rand, randi, chance, mulberry32 } from '../lib/util';
+import { C, clamp, lerp, rand, randi, chance, pick, shade, mulberry32 } from '../lib/util';
 import { sfx } from '../lib/audio';
 import { tapWord, input } from '../lib/input';
 import { updateRecords } from '../lib/records';
+import { TEAMS, drawBadge, drawLeagueBug } from './cricketTeams';
 
 type Side = -1 | 1;
 type Outcome = 'six' | 'four' | 'two' | 'one' | 'dot' | 'caught' | 'behind' | 'bowled' | 'beaten';
-type State = 'title' | 'ready' | 'runup' | 'flight' | 'hit' | 'result' | 'over';
+type State = 'team' | 'title' | 'ready' | 'runup' | 'flight' | 'hit' | 'result' | 'over';
+
+// team picker grid (5 x 2) and the back button on the stance card (game px)
+const teamCell = (i: number) => ({ cx: 72 + (i % 5) * 44, top: 46 + Math.floor(i / 5) * 34 });
+const BACK_BTN = { x: 67, y: 20, w: 34, h: 10 };
+const BATTER_NUMS = [7, 18, 45, 10];
+const BOWLERS = ['IYER', 'KHAN', 'RAO', 'SINGH', 'PATEL', 'NAIR', 'GILL', 'DAS', 'MENON', 'BOSE', 'REDDY', 'JOSHI'];
 
 // Side-on batsman seen from behind the stumps (keeper's view): body on the leg side, facing the
 // off side, bat grounded in front of the stumps. The base drawing faces screen-left, which is a
 // LEFT-hander from this angle; right-handers are drawn mirrored. Hands are relative to the feet.
 interface Pose { hx: number; hy: number; a: number }
-const P_IDLE: Pose = { hx: -7, hy: -21, a: 100 };
-const P_BACK: Pose = { hx: 1, hy: -36, a: -55 };
-const P_CONTACT: Pose = { hx: -8, hy: -24, a: 160 };
-const P_FOLLOW: Record<Side, Pose> = { [-1]: { hx: -9, hy: -36, a: 215 }, [1]: { hx: 5, hy: -34, a: 330 } } as Record<Side, Pose>;
+const P_IDLE: Pose = { hx: -5, hy: -14, a: 100 };
+const P_BACK: Pose = { hx: 1, hy: -25, a: -55 };
+const P_CONTACT: Pose = { hx: -5, hy: -16, a: 160 };
+const P_FOLLOW: Record<Side, Pose> = { [-1]: { hx: -6, hy: -25, a: 215 }, [1]: { hx: 4, hy: -23, a: 330 } } as Record<Side, Pose>;
+const BAT_LEN = 14;  // handle + blade, px
+const NUM_Y = 22;    // shirt number height above the feet
 const lerpPose = (a: Pose, b: Pose, t: number): Pose => ({ hx: lerp(a.hx, b.hx, t), hy: lerp(a.hy, b.hy, t), a: lerp(a.a, b.a, t) });
 
 const FAR_Y = 54;
-const NEAR_Y = 136;
-const BX = 171, BY = 152; // batsman's back foot
+// Near end, seen from behind the stumps: stumps closest to the camera, the batsman just in
+// front of them at the popping crease (toward the bowler), the ball meeting his bat beyond.
+const NEAR_Y = 128;              // where the delivery reaches the bat
+const BX = 171, BY = 136;        // batsman's back foot, at the popping crease
+const POP_Y = 132;               // popping crease line
+const STUMP_BASE = 145, STUMP_TOP = 131;
 const TOTAL_BALLS = 18;
 const MAX_WKTS = 3;
 const newTarget = () => randi(25, 80);
+
+/** Boundary rope: flat along the far stands, curving down only near the sides of the ground. */
+const ropeY = (x: number) => 47 + Math.pow(Math.min(1, Math.abs(x - 160) / 160), 5) * 28;
 
 // ground shots skip along the outfield: decaying hops (share of flight time, height px), then a roll
 const HOPS_RUN = [{ len: 0.3, h: 9 }, { len: 0.22, h: 5 }, { len: 0.17, h: 2.5 }, { len: 0.12, h: 1 }];
@@ -33,21 +49,66 @@ const HOPS_FOUR = [{ len: 0.22, h: 5 }, { len: 0.15, h: 2 }, { len: 0.1, h: 0.8 
 
 // stance picker buttons on the title card (game px)
 const STANCE_BTNS = [
-  { x: 74, y: 98, w: 82, h: 15, label: 'RIGHT-HANDED' },
-  { x: 164, y: 98, w: 82, h: 15, label: 'LEFT-HANDED' },
+  { x: 74, y: 96, w: 82, h: 15, label: 'RIGHT-HANDED' },
+  { x: 164, y: 96, w: 82, h: 15, label: 'LEFT-HANDED' },
+];
+
+// ---- difficulty ----
+interface Level {
+  label: string; color: string;
+  win: [number, number, number, number]; // timing windows (s) for perfect / good / ok / edge
+  pace: number;                          // extra km/h
+  stumps: number;                        // share of deliveries aimed at the stumps
+  gapPerfectSix: number;                 // perfect timing into the gap: chance of six (else four)
+  gapGoodSix: number;                    // good timing into the gap: chance of six (else four)
+  fieldPerfect: [number, number];        // perfect timing at the deep fielder: [six over him, caught]
+  fieldGoodCaught: number;               // good timing at the deep fielder: chance he catches it
+  edgeOut: number;                       // edges carried to the keeper
+}
+const LEVELS: Level[] = [
+  {
+    label: 'BEGINNER', color: C.green, win: [0.075, 0.12, 0.17, 0.22], pace: 0, stumps: 0.45,
+    gapPerfectSix: 1, gapGoodSix: 0.45, fieldPerfect: [0.35, 0.2], fieldGoodCaught: 0.15, edgeOut: 0.15,
+  },
+  {
+    // sixes need genuinely good timing: the perfect window is ±30ms instead of ±75ms
+    label: 'INTERMEDIATE', color: C.yellow, win: [0.03, 0.06, 0.1, 0.15], pace: 10, stumps: 0.55,
+    gapPerfectSix: 0.7, gapGoodSix: 0.05, fieldPerfect: [0.15, 0.35], fieldGoodCaught: 0.3, edgeOut: 0.3,
+  },
+];
+const LEVEL_BTNS = [
+  { x: 92, y: 70, w: 64, h: 12 },
+  { x: 164, y: 70, w: 64, h: 12 },
 ];
 
 interface Fielder { hx: number; hy: number; x: number; y: number; tx: number; ty: number; arms: number }
 
 export class Cricket implements Game {
-  state: State = 'title';
+  state: State = 'team';
   t = 0;
   time = 0;
   target = newTarget();
+  team = 0;
+  opp = 1;
+  teamSel = 0;
+  // broadcast stats
+  batter = 0;
+  batRuns = 0;
+  batBalls = 0;
+  newBatterNext = false;
+  bowler = 'IYER';
+  bowlRuns = 0;
+  bowlWkts = 0;
+  bowlBalls = 0;
+  overStart = 0;
+  barIn = 0;
   /** left-handed batsman (right-handers are the ones drawn mirrored around the stumps) */
   lefty = false;
   stanceSel = 0;
+  level = 0;
+  private get L() { return LEVELS[this.level]; }
   hop = 0;
+  ropeCrossed = false;
   runs = 0;
   wkts = 0;
   balls = 0;
@@ -83,16 +144,41 @@ export class Cricket implements Game {
       const x = Math.round(160 + (r() * 2 - 1) * hw);
       this.pitchNoise.push([x, y, r() < 0.5 ? '#B8955B' : '#D6B67C']);
     }
+    sfx.startCrowd();
   }
 
+  destroy() { sfx.stopCrowd(); }
+
+  private get T() { return TEAMS[this.team]; }
+  private get O() { return TEAMS[this.opp]; }
+
   // ---------------- flow ----------------
+  /** Lock in your team; draw a random opponent and a fresh target. */
+  private setupFixture() {
+    const others = TEAMS.map((_, i) => i).filter((i) => i !== this.team);
+    this.opp = pick(others);
+    this.target = newTarget();
+    const a = this.T.main, b = this.O.main;
+    this.stands = new Stands(0, 10, W, 31, '#1B1740', [a, a, a, b, b, C.white, C.lavender], 11 + this.team);
+  }
+
   private newMatch() {
     this.runs = 0; this.wkts = 0; this.balls = 0; this.log = [];
+    this.batter = 0; this.batRuns = 0; this.batBalls = 0; this.newBatterNext = false;
+    this.overStart = 0; this.barIn = 0;
+    this.newBowler();
     this.parts.list.length = 0; this.pops.clear();
     this.toReady();
   }
 
+  private newBowler() {
+    this.bowler = pick(BOWLERS.filter((b) => b !== this.bowler));
+    this.bowlRuns = 0; this.bowlWkts = 0; this.bowlBalls = 0;
+  }
+
   private toReady() {
+    if (this.newBatterNext) { this.batter++; this.batRuns = 0; this.batBalls = 0; this.newBatterNext = false; }
+    if (this.balls > 0 && this.balls % 6 === 0 && this.overStart !== this.balls) { this.overStart = this.balls; this.newBowler(); }
     this.state = 'ready'; this.t = 0;
     this.swing = null; this.pending = null; this.missed = false; this.hit = null; this.timing = ''; this.stumpsDown = 0; this.bounced = false;
     this.fielderSide = chance(0.5) ? -1 : 1;
@@ -100,8 +186,8 @@ export class Cricket implements Game {
     this.deep.x = this.deep.hx; this.deep.y = this.deep.hy; this.deep.tx = this.deep.hx; this.deep.ty = this.deep.hy; this.deep.arms = 0;
     for (const f of this.fielders) { f.tx = f.hx; f.ty = f.hy; f.arms = 0; }
     const over = Math.floor(this.balls / 6);
-    const speed = randi(116, 126) + over * 8 + randi(0, 8);
-    const onStumps = chance(0.45);
+    const speed = randi(116, 126) + over * 8 + randi(0, 8) + this.L.pace;
+    const onStumps = chance(this.L.stumps);
     this.del = {
       speed,
       T: lerp(1.08, 0.72, clamp((speed - 115) / 42, 0, 1)),
@@ -119,21 +205,27 @@ export class Cricket implements Game {
     sfx.play('swing');
     const dt = this.t - this.del.T;
     const a = Math.abs(dt);
-    // generous windows: sixes should feel reachable
-    const q = a <= 0.075 ? 'perfect' : a <= 0.12 ? 'good' : a <= 0.17 ? 'ok' : a <= 0.22 ? 'edge' : 'miss';
+    // timing windows and outcomes depend on the chosen difficulty
+    const L = this.L;
+    const [wPerfect, wGood, wOk, wEdge] = L.win;
+    const q = a <= wPerfect ? 'perfect' : a <= wGood ? 'good' : a <= wOk ? 'ok' : a <= wEdge ? 'edge' : 'miss';
     this.timing = q === 'perfect' ? 'PERFECT TIMING' : q === 'good' ? 'GOOD TIMING' : q === 'miss' ? (dt < 0 ? 'WAY TOO EARLY' : 'TOO LATE') : dt < 0 ? 'A BIT EARLY' : 'A BIT LATE';
     if (q === 'miss') { this.missed = true; return; }
     const into = side === this.fielderSide;
     let o: Outcome;
     let deep = false;
     if (q === 'perfect') {
-      if (!into) o = 'six';
-      else { const r = Math.random(); o = r < 0.35 ? 'six' : r < 0.55 ? 'caught' : 'two'; deep = o === 'two'; }
+      if (!into) o = chance(L.gapPerfectSix) ? 'six' : 'four';
+      else {
+        const r = Math.random();
+        o = r < L.fieldPerfect[0] ? 'six' : r < L.fieldPerfect[0] + L.fieldPerfect[1] ? 'caught' : 'two';
+        deep = o === 'two';
+      }
     } else if (q === 'good') {
-      if (!into) o = chance(0.45) ? 'six' : 'four';
-      else { o = chance(0.15) ? 'caught' : 'two'; deep = o === 'two'; }
+      if (!into) o = chance(L.gapGoodSix) ? 'six' : 'four';
+      else { o = chance(L.fieldGoodCaught) ? 'caught' : 'two'; deep = o === 'two'; }
     } else if (q === 'ok') { o = 'two'; deep = into; }
-    else o = chance(0.15) ? 'behind' : 'one';
+    else o = chance(L.edgeOut) ? 'behind' : 'one';
     this.pending = { o, side, deep };
     if (dt >= 0) this.startHit();
   }
@@ -141,7 +233,8 @@ export class Cricket implements Game {
   private ballScreen(s: number) {
     const d = this.del;
     const f = s <= 1 ? Math.pow(Math.max(0, s), 1.5) : 1 + (s - 1) * 0.9;
-    const y = s <= 1 ? FAR_Y + (NEAR_Y - FAR_Y) * f : NEAR_Y + (s - 1) * 70;
+    // past the bat it carries on to the stumps (and the keeper beyond them)
+    const y = s <= 1 ? FAR_Y + (NEAR_Y - FAR_Y) * f : NEAR_Y + (s - 1) * 110;
     const x = 163 + (d.line - 163) * Math.min(s, 1) + (s > 1 ? (d.line - 163) * (s - 1) : 0);
     let h: number;
     if (s < d.bounce) { const u = s / d.bounce; h = 1 - u * u; }
@@ -162,7 +255,10 @@ export class Cricket implements Game {
     let tx = 0, ty = 0, dur = 0.7, arc = 6;
     switch (o) {
       case 'six': tx = side < 0 ? randi(24, 92) : randi(228, 296); ty = randi(14, 28); dur = 1.15; arc = 46; break;
-      case 'four': tx = side < 0 ? randi(3, 12) : randi(308, 317); ty = randi(58, 84); dur = 0.8; arc = 2; break;
+      case 'four':
+        // along the ground to the side boundary, finishing a few px over the rope
+        tx = side < 0 ? randi(8, 40) : randi(280, 312); ty = Math.round(ropeY(tx)) - 4; dur = 1.05; arc = 2;
+        break;
       case 'two':
         // into the deep fielder: he collects it in the outfield while they run two
         if (deep) { tx = this.deep.x + 2; ty = this.deep.y - 4; dur = 0.9; arc = 10; }
@@ -175,6 +271,7 @@ export class Cricket implements Game {
     }
     this.hit = { o, side, deep, t: 0, dur, fx, fy, tx, ty, arc };
     this.hop = 0;
+    this.ropeCrossed = false;
     this.state = 'hit';
     this.t = 0;
     // fielders react
@@ -199,15 +296,18 @@ export class Cricket implements Game {
     this.runs += runs;
     if (wicket) this.wkts++;
     this.log.push(wicket ? 'W' : runs ? String(runs) : '.');
+    this.batRuns += runs; this.batBalls++;
+    this.bowlRuns += runs; this.bowlBalls++;
+    if (wicket) { this.bowlWkts++; this.newBatterNext = true; }
     const sub = this.timing || undefined;
     switch (o) {
       case 'six':
         this.pops.add('SIX!', { scale: 5, rainbow: true, sub, dur: 1.7 });
-        sfx.play('six'); sfx.play('cheer');
+        sfx.play('six'); sfx.roar(1);
         this.stands.cheer(1);
         for (let i = 0; i < 4; i++) this.after(i * 0.22, () => this.parts.burst(randi(40, 280), randi(8, 30), 26, { colors: CONFETTI, speed: 55, g: 30, life: 1 }));
         break;
-      case 'four': this.pops.add('FOUR!', { scale: 4, color: C.yellow, sub, dur: 1.6 }); sfx.play('four'); sfx.play('cheer'); this.stands.cheer(0.75); break;
+      case 'four': this.pops.add('FOUR!', { scale: 4, color: C.yellow, sub, dur: 1.6 }); sfx.play('four'); sfx.roar(0.7); this.stands.cheer(0.75); break;
       case 'two':
         this.pops.add('2 RUNS', { scale: 3, color: C.white, sub: this.hit?.deep ? 'FIELDED IN THE DEEP' : sub });
         sfx.play('run'); this.after(0.15, () => sfx.play('run'));
@@ -235,6 +335,10 @@ export class Cricket implements Game {
   }
 
   // ---------------- input ----------------
+  private levelAt(x: number, y: number) {
+    return LEVEL_BTNS.findIndex((b) => x >= b.x - 2 && x <= b.x + b.w + 2 && y >= b.y - 2 && y <= b.y + b.h + 2);
+  }
+
   private stanceAt(x: number, y: number) {
     return STANCE_BTNS.findIndex((b) => x >= b.x - 2 && x <= b.x + b.w + 2 && y >= b.y - 3 && y <= b.y + b.h + 3);
   }
@@ -246,21 +350,49 @@ export class Cricket implements Game {
     this.newMatch();
   }
 
+  private teamAt(x: number, y: number) {
+    return TEAMS.findIndex((_, i) => { const { cx, top } = teamCell(i); return x >= cx - 20 && x <= cx + 20 && y >= top - 3 && y <= top + 27; });
+  }
+
+  private pickTeam(i: number) {
+    this.team = i; this.teamSel = i;
+    sfx.play('select');
+    this.setupFixture();
+    this.state = 'title'; this.t = 0;
+  }
+
+  private onBack(x: number, y: number) {
+    const b = BACK_BTN;
+    return x >= b.x - 2 && x <= b.x + b.w + 2 && y >= b.y - 2 && y <= b.y + b.h + 2;
+  }
+
   pointerDown(x: number, y = 80) {
+    if (this.state === 'team') {
+      const i = this.teamAt(x, y);
+      if (i >= 0) this.pickTeam(i);
+      return;
+    }
     if (this.state === 'title') {
+      if (this.onBack(x, y)) { sfx.play('close'); this.state = 'team'; this.t = 0; return; }
+      const lv = this.levelAt(x, y);
+      if (lv >= 0) { if (lv !== this.level) { this.level = lv; sfx.play('select'); } return; }
       const i = this.stanceAt(x, y);
       if (i >= 0) this.startWithStance(i);
       return;
     }
     if (this.state === 'over') {
-      // back to the title card: new target, pick your stance again
-      if (this.t > 0.8) { sfx.play('select'); this.target = newTarget(); this.state = 'title'; this.t = 0; this.pops.clear(); }
+      // back to the stance card: same team, new opponent and target
+      if (this.t > 0.8) { sfx.play('select'); this.setupFixture(); this.state = 'title'; this.t = 0; this.pops.clear(); }
       return;
     }
     this.swingAt(x < W / 2 ? -1 : 1);
   }
   pointerMove(x: number, y = 80) {
     this.hover = x < W / 2 ? -1 : 1;
+    if (this.state === 'team') {
+      const i = this.teamAt(x, y);
+      if (i >= 0 && i !== this.teamSel) { this.teamSel = i; sfx.play('blip'); }
+    }
     if (this.state === 'title') {
       const i = this.stanceAt(x, y);
       if (i >= 0 && i !== this.stanceSel) { this.stanceSel = i; sfx.play('blip'); }
@@ -269,9 +401,22 @@ export class Cricket implements Game {
   keyDown(code: string) {
     const left = code === 'ArrowLeft' || code === 'KeyA';
     const right = code === 'ArrowRight' || code === 'KeyD';
+    const up = code === 'ArrowUp' || code === 'KeyW';
+    const down = code === 'ArrowDown' || code === 'KeyS';
     const go = code === 'Space' || code === 'Enter';
+    if (this.state === 'team') {
+      const n = TEAMS.length;
+      if (left) this.teamSel = (this.teamSel + n - 1) % n;
+      if (right) this.teamSel = (this.teamSel + 1) % n;
+      if (up || down) this.teamSel = (this.teamSel + 5) % n;
+      if (left || right || up || down) sfx.play('blip');
+      if (go) this.pickTeam(this.teamSel);
+      return;
+    }
     if (this.state === 'title') {
       if (left || right) { this.stanceSel = left ? 0 : 1; sfx.play('blip'); }
+      if (up || down) { this.level = 1 - this.level; sfx.play('blip'); }
+      if (code === 'Backspace' || code === 'Escape') { sfx.play('close'); this.state = 'team'; this.t = 0; return; }
       if (go) this.startWithStance(this.stanceSel);
       return;
     }
@@ -284,6 +429,7 @@ export class Cricket implements Game {
   // ---------------- update ----------------
   update(dt: number) {
     this.t += dt; this.time += dt;
+    if (this.state !== 'team' && this.state !== 'title') this.barIn = Math.min(1, this.barIn + dt * 3);
     this.stands.update(dt); this.parts.update(dt); this.pops.update(dt);
     for (let i = this.timers.length - 1; i >= 0; i--) { const tm = this.timers[i]; tm.t -= dt; if (tm.t <= 0) { this.timers.splice(i, 1); tm.fn(); } }
     if (this.swing) this.swing.t += dt;
@@ -308,7 +454,7 @@ export class Cricket implements Game {
         else if (!this.pending && this.t >= this.del.T + 0.1 && this.del.onStumps && !this.stumpsDown) {
           this.stumpsDown = 0.001;
           sfx.play('stumps');
-          this.parts.burst(160, 135, 10, { colors: ['#F3E2B8', '#E9C784', C.white], speed: 70, up: true, life: 0.9 });
+          this.parts.burst(160, STUMP_TOP + 1, 10, { colors: ['#F3E2B8', '#E9C784', C.white], speed: 70, up: true, life: 0.9 });
           this.finishBall('bowled');
         } else if (!this.pending && s >= 1.32) {
           this.finishBall(this.missed ? 'beaten' : 'dot');
@@ -329,6 +475,16 @@ export class Cricket implements Game {
           const bx = lerp(h.fx, h.tx, p), by = lerp(h.fy + 4, h.ty, p);
           sfx.play('bounce');
           this.parts.burst(bx, by, 4, { colors: ['#9FD7A9', '#5FA772', C.white], speed: 18, up: true, life: 0.35, g: 40 });
+        }
+        // a four rolls over the rope: puff of chalk and the crowd on that side jumps up
+        if (h.o === 'four' && !this.ropeCrossed) {
+          const p = this.hitProgress(h, clamp(h.t / h.dur, 0, 1));
+          const bx = lerp(h.fx, h.tx, p), by = lerp(h.fy + 4, h.ty, p);
+          if (by <= ropeY(bx)) {
+            this.ropeCrossed = true;
+            this.parts.burst(bx, by, 10, { colors: [C.white, '#E8E4F5'], speed: 26, up: true, life: 0.5, g: 50 });
+            this.stands.cheer(0.9, bx);
+          }
         }
         if (h.t >= h.dur) {
           if (h.o === 'six') this.stands.cheer(1, h.tx);
@@ -373,7 +529,7 @@ export class Cricket implements Game {
     this.drawFielder(g, this.deep, true);
     // ball in flight/hit, behind batsman when far
     this.drawBall(g, false);
-    this.drawStumps(g);
+    // batsman first, then the stumps over him: the wicket is behind him, nearest the camera
     if (!this.lefty) {
       // right-hander: mirror the base (left-handed) drawing around the stumps (x = 160)
       g.save();
@@ -381,15 +537,19 @@ export class Cricket implements Game {
       g.scale(-1, 1);
       this.drawBatsman(g, this.currentPose(), false);
       g.restore();
+      // shirt number drawn un-mirrored at the mirrored position so it stays readable
       const lean = this.swing && this.swing.t < 0.95 ? -1 : 0;
-      drawText(g, '7', W - (BX + lean + 1) - 3, BY - 31, { color: C.violet });
+      const num = this.shirtNumber();
+      drawText(g, num, W - this.numberX(num, BX + lean) - measure(num), BY - NUM_Y, { color: this.T.trim });
     } else {
       this.drawBatsman(g, this.currentPose(), true);
     }
+    this.drawStumps(g);
     this.drawBall(g, true);
     this.parts.draw(g);
     this.drawHud(g);
     this.pops.draw(g);
+    if (this.state === 'team') this.drawTeams(g);
     if (this.state === 'title') this.drawTitle(g);
     if (this.state === 'over') this.drawOver(g);
   }
@@ -413,24 +573,27 @@ export class Cricket implements Game {
       const y1 = Math.round(46 + 114 * Math.pow((k + 1) / N, 1.35));
       rect(g, 0, y0, W, y1 - y0, k % 2 ? '#2F6E4D' : '#357A55');
     }
-    // boundary rope
-    for (let x = 0; x < W; x += 2) {
-      const y = 48 + Math.round(Math.pow((x - 160) / 160, 2) * 7);
-      px(g, x, y, '#F4F1FF');
+    // beyond the boundary: slightly darker grass, then the dashed rope itself
+    g.fillStyle = 'rgba(3,5,11,0.16)';
+    for (let x = 0; x < W; x++) { const ry = Math.round(ropeY(x)); if (ry > 46) g.fillRect(x, 46, 1, ry - 46); }
+    for (let x = 0; x < W - 1; x++) {
+      if (Math.floor(x / 3) % 2) continue;
+      line(g, x, Math.round(ropeY(x)), x + 1, Math.round(ropeY(x + 1)), '#F4F1FF');
     }
     // pitch
     for (let y = 48; y < H; y++) {
       const t = (y - 48) / 112;
       const hw = lerp(6, 34, t);
-      rect(g, 160 - hw, y, hw * 2, 1, y < 60 || y > 138 ? '#BE9A5E' : '#C9A86C');
+      rect(g, 160 - hw, y, hw * 2, 1, y < 60 || y > POP_Y - 3 ? '#BE9A5E' : '#C9A86C');
     }
     for (const [x, y, c] of this.pitchNoise) px(g, x, y, c);
     // creases
     rect(g, 150, 57, 20, 1, C.white);
-    rect(g, 118, 141, 84, 1, C.white);
-    rect(g, 124, 150, 72, 1, 'rgba(244,241,255,0.6)');
-    line(g, 128, 141, 124, 158, 'rgba(244,241,255,0.6)');
-    line(g, 192, 141, 196, 158, 'rgba(244,241,255,0.6)');
+    // near end: popping crease in front of the batsman, bowling crease under the stumps
+    rect(g, 120, POP_Y, 80, 1, C.white);
+    rect(g, 126, STUMP_BASE, 68, 1, 'rgba(244,241,255,0.6)');
+    line(g, 130, POP_Y, 125, 152, 'rgba(244,241,255,0.6)');
+    line(g, 190, POP_Y, 195, 152, 'rgba(244,241,255,0.6)');
   }
 
   private drawFarEnd(g: CanvasRenderingContext2D) {
@@ -439,8 +602,8 @@ export class Cricket implements Game {
     rect(g, 158, 50, 5, 1, '#E9C784');
     // umpire
     miniPerson(g, 151, 56, 12, C.white, '#222', 'stand', C.skin2, '#111');
-    // non-striker
-    miniPerson(g, 170, 58, 12, C.white, C.white, 'stand', C.skin);
+    // non-striker (your team)
+    miniPerson(g, 170, 58, 12, this.T.main, this.T.pants, 'stand', C.skin, this.T.helmet);
     line(g, 172, 51, 173, 57, '#E9C784');
     // bowler
     let bx = 163, by = 56, pose: 'stand' | 'run1' | 'run2' = 'stand';
@@ -457,11 +620,11 @@ export class Cricket implements Game {
       pose = this.state === 'flight' && this.t < 0.6 ? (Math.floor(this.t * 10) % 2 ? 'run1' : 'run2') : 'stand';
       arm = 70;
     } else { bx = 158; by = 61; }
-    miniPerson(g, bx, by, 13, C.violet, C.white, pose, C.skin2);
+    miniPerson(g, bx, by, 13, this.O.main, this.O.pants, pose, C.skin2);
     // bowling arm
     const sx = Math.round(bx + 1), sy = Math.round(by - 9);
     const r = (arm * Math.PI) / 180;
-    line(g, sx, sy, sx + Math.cos(r) * 5, sy + Math.sin(r) * 5, C.violet);
+    line(g, sx, sy, sx + Math.cos(r) * 5, sy + Math.sin(r) * 5, this.O.main);
     if (this.state === 'runup' || this.state === 'ready') {
       const hx = sx + Math.cos(r) * 5, hy = sy + Math.sin(r) * 5;
       px(g, hx, hy, C.red);
@@ -469,12 +632,13 @@ export class Cricket implements Game {
   }
 
   private drawFielder(g: CanvasRenderingContext2D, f: Fielder, deep = false) {
-    const h = Math.round(8 + (f.y - 60) / 12);
+    // a touch bigger the nearer they are, so they sit in scale with the batsman
+    const h = Math.round(9 + (f.y - 60) / 8);
     const moving = Math.hypot(f.tx - f.x, f.ty - f.y) > 0.8;
     const pose = f.arms ? 'arms' : moving ? (Math.floor(this.time * 10) % 2 ? 'run1' : 'run2') : 'stand';
     g.fillStyle = 'rgba(0,0,0,0.25)';
     g.fillRect(Math.round(f.x) - 2, Math.round(f.y), 5, 1);
-    miniPerson(g, f.x, f.y, h, C.violet, C.white, pose, C.skin2);
+    miniPerson(g, f.x, f.y, h, this.O.main, this.O.pants, pose, C.skin2);
     if (deep && (this.state === 'ready' || this.state === 'runup') && Math.floor(this.time * 4) % 2) {
       drawText(g, '!', f.x, f.y - h - 7, { color: C.yellow, align: 'center', outline: C.ink });
     }
@@ -485,59 +649,63 @@ export class Cricket implements Game {
     const xs = [157, 160, 163];
     xs.forEach((x, i) => {
       const lean = k ? Math.round(Math.min(4, k * 30) * (i - 1 || 0.5)) : 0;
-      line(g, x, 150, x + lean, 137 + (k ? Math.min(2, Math.round(k * 10)) : 0), '#F3E2B8', 2);
+      line(g, x, STUMP_BASE, x + lean, STUMP_TOP + (k ? Math.min(2, Math.round(k * 10)) : 0), '#F3E2B8', 2);
     });
-    if (!k) { rect(g, 156, 136, 4, 1, '#E9C784'); rect(g, 160, 136, 4, 1, '#E9C784'); }
+    if (!k) { rect(g, 156, STUMP_TOP - 1, 4, 1, '#E9C784'); rect(g, 160, STUMP_TOP - 1, 4, 1, '#E9C784'); }
   }
 
-  /** Side-on stance: front (left) leg toward the bowler, knees bent, head turned up the pitch. */
+  private shirtNumber() { return String(BATTER_NUMS[this.batter] ?? 7); }
+  /** Left edge of the shirt number on the torso (torso spans tx-3..tx+3). */
+  private numberX(n: string, tx: number) { return n.length > 1 ? tx - 3 : tx - 1; }
+
+  /**
+   * Side-on stance, about 31px tall (in scale with the fielders): front (left) leg toward the
+   * bowler, knees bent, head turned up the pitch. Team shirt, trousers and helmet; white pads.
+   */
   private drawBatsman(g: CanvasRenderingContext2D, pose: Pose, number: boolean) {
     const x = BX, y = BY;
+    const T = this.T;
     const lean = this.swing && this.swing.t < 0.95 ? -1 : 0; // weight transfers into the shot
     g.fillStyle = 'rgba(0,0,0,0.3)';
-    g.fillRect(x - 15, y - 2, 23, 3);
+    g.fillRect(x - 10, y - 1, 16, 2);
     // front leg (further from camera), pointing at the off side
-    line(g, x - 2, y - 21, x - 6 + lean, y - 12, '#D8D4E6', 4);
-    line(g, x - 6 + lean, y - 12, x - 7 + lean, y - 6, '#DCD9E6', 5);
-    rect(g, x - 9 + lean, y - 10, 5, 1, '#B4B0C6');
-    rect(g, x - 14 + lean, y - 5, 7, 2, '#25213A');
+    line(g, x - 1, y - 14, x - 4 + lean, y - 8, shade(T.pants, 0.8), 3);
+    line(g, x - 4 + lean, y - 8, x - 5 + lean, y - 4, '#DCD9E6', 3);
+    rect(g, x - 9 + lean, y - 3, 5, 2, '#25213A');
     // back leg (nearer), knee bent forward
-    line(g, x + 2, y - 21, x - 1, y - 11, '#F4F1FF', 4);
-    line(g, x - 1, y - 11, x + 1, y - 3, '#EDEBF5', 5);
-    rect(g, x - 3, y - 9, 6, 1, '#B4B0C6');
-    rect(g, x - 3, y - 5, 6, 1, '#B4B0C6');
-    rect(g, x - 5, y - 2, 8, 2, '#25213A');
+    line(g, x + 1, y - 14, x - 1, y - 7, T.pants, 3);
+    line(g, x - 1, y - 7, x, y - 3, '#EDEBF5', 4);
+    rect(g, x - 2, y - 5, 4, 1, '#B4B0C6');
+    rect(g, x - 3, y - 2, 6, 2, '#25213A');
     // hips
-    rect(g, x - 4, y - 24, 9, 5, '#F4F1FF');
-    rect(g, x + 3, y - 24, 2, 5, '#D8D4E6');
-    // torso in profile, leaning over the front knee
+    rect(g, x - 3, y - 16, 6, 3, T.pants);
+    rect(g, x + 2, y - 16, 1, 3, shade(T.pants, 0.8));
+    // torso in profile (team shirt), leaning over the front knee
     const tx = x + lean;
-    rect(g, tx - 5, y - 34, 10, 11, '#F4F1FF');
-    rect(g, tx - 6, y - 32, 1, 7, '#F4F1FF');
-    rect(g, tx + 2, y - 34, 3, 11, '#D8D4E6');
-    rect(g, tx - 5, y - 34, 10, 1, C.violet);
-    if (number) drawText(g, '7', tx + 1, y - 31, { color: C.violet });
-    // helmet in profile, looking up the pitch
-    rect(g, tx - 1, y - 36, 3, 2, C.skin2);
-    rect(g, tx - 4, y - 43, 8, 8, '#1E2A6E');
-    rect(g, tx - 3, y - 44, 6, 1, '#1E2A6E');
-    rect(g, tx + 1, y - 42, 2, 2, '#3D4FA8');
-    rect(g, tx - 6, y - 39, 3, 1, '#141C4A');
-    rect(g, tx - 6, y - 38, 1, 4, '#B9B5C9');
-    rect(g, tx - 5, y - 35, 2, 1, '#B9B5C9');
-    rect(g, tx + 1, y - 36, 4, 2, '#141C4A');
-    // arms + bat
+    rect(g, tx - 3, y - 23, 7, 8, T.main);
+    rect(g, tx - 4, y - 22, 1, 5, T.main);
+    rect(g, tx + 2, y - 23, 2, 8, shade(T.main, 0.8));
+    rect(g, tx - 3, y - 23, 7, 1, T.trim);
+    if (number) { const n = this.shirtNumber(); drawText(g, n, this.numberX(n, tx), y - NUM_Y, { color: T.trim }); }
+    // helmet in team colours, in profile, looking up the pitch
+    rect(g, tx - 1, y - 24, 2, 1, C.skin2);
+    rect(g, tx - 3, y - 30, 6, 6, T.helmet);
+    rect(g, tx - 2, y - 31, 4, 1, T.helmet);
+    rect(g, tx + 1, y - 29, 1, 1, shade(T.helmet, 1.6));
+    rect(g, tx - 5, y - 27, 2, 1, shade(T.helmet, 0.6));
+    rect(g, tx - 4, y - 26, 1, 2, '#B9B5C9');
+    rect(g, tx + 1, y - 25, 3, 1, shade(T.helmet, 0.6));
+    // arms (team sleeves) + bat
     const hx = x + pose.hx, hy = y + pose.hy;
-    line(g, tx + 2, y - 32, hx, hy, '#E4E1EE', 2);
-    line(g, tx - 3, y - 31, hx, hy, '#F4F1FF', 2);
+    line(g, tx + 1, y - 22, hx, hy, shade(T.main, 0.85), 2);
+    line(g, tx - 2, y - 21, hx, hy, T.main, 2);
     const r = (pose.a * Math.PI) / 180, dx = Math.cos(r), dy = Math.sin(r);
-    line(g, hx, hy, hx + dx * 5, hy + dy * 5, '#B03030', 2);
+    line(g, hx, hy, hx + dx * 3, hy + dy * 3, '#B03030', 1);
     // dark rim first so the willow reads against the cream stumps behind it
-    line(g, hx + dx * 5, hy + dy * 5, hx + dx * 20, hy + dy * 20, '#5A3E1E', 5);
-    line(g, hx + dx * 5, hy + dy * 5, hx + dx * 19, hy + dy * 19, '#E9C784', 3);
-    line(g, hx + dx * 6 - dy, hy + dy * 6 + dx, hx + dx * 19 - dy, hy + dy * 19 + dx, '#B98F47', 1);
-    rect(g, hx - 2, hy - 2, 4, 4, C.white);
-    rect(g, hx - 1, hy - 1, 2, 2, C.blue);
+    line(g, hx + dx * 3, hy + dy * 3, hx + dx * BAT_LEN, hy + dy * BAT_LEN, '#5A3E1E', 3);
+    line(g, hx + dx * 3, hy + dy * 3, hx + dx * (BAT_LEN - 1), hy + dy * (BAT_LEN - 1), '#E9C784', 2);
+    rect(g, hx - 1, hy - 1, 3, 3, C.white);
+    rect(g, hx, hy, 1, 1, C.blue);
   }
 
   private drawBall(g: CanvasRenderingContext2D, near: boolean) {
@@ -591,46 +759,130 @@ export class Cricket implements Game {
     if (d >= 4) rect(g, Math.round(x) - 1, Math.round(y - d / 2) + 1, 1, d - 2, '#F7E7CE');
   }
 
+  /** TV-style graphics: league crest top-left, two-tier score bar along the bottom. */
   private drawHud(g: CanvasRenderingContext2D) {
-    if (this.state === 'title') return;
-    rect(g, 0, 0, W, 11, 'rgba(3,5,11,0.8)');
-    drawText(g, `TARGET ${this.target}`, 4, 3, { color: C.yellow });
-    drawText(g, `${this.runs}/${this.wkts}`, W / 2 - 8, 3, { color: C.white, align: 'center' });
-    for (let i = 0; i < MAX_WKTS; i++) {
-      const c = i < this.wkts ? C.red : C.lavender;
-      rect(g, W / 2 + 6 + i * 5, 3, 1, 5, c); rect(g, W / 2 + 8 + i * 5, 3, 1, 5, c);
-    }
-    drawText(g, `BALLS LEFT ${TOTAL_BALLS - this.balls}`, W - 4, 3, { color: C.lavender, align: 'right' });
-
-    rect(g, 0, H - 10, 84, 10, 'rgba(3,5,11,0.75)');
-    const need = Math.max(0, this.target - this.runs);
-    drawText(g, `NEED ${need} OFF ${TOTAL_BALLS - this.balls}`, 4, H - 7, { color: C.white });
-
-    rect(g, W - 84, H - 10, 84, 10, 'rgba(3,5,11,0.75)');
-    const last = this.log.slice(-6);
-    drawText(g, last.length ? last.join(' ') : '-', W - 4, H - 7, { color: C.white, align: 'right' });
-    drawText(g, `${this.del.speed}KM/H`, W - 4, H - 17, { color: C.lavender, align: 'right', outline: C.ink });
+    if (this.state === 'team' || this.state === 'title') return;
+    const T = this.T, O = this.O;
+    drawLeagueBug(g, 4, 4);
+    drawText(g, this.L.label, 4, 26, { color: this.L.color, outline: C.ink });
 
     if (this.state === 'ready' || this.state === 'runup' || (this.state === 'flight' && this.t < 0.35)) {
       const side = this.fielderSide < 0 ? 'LEFT' : 'RIGHT';
       const gap = this.fielderSide < 0 ? 'RIGHT' : 'LEFT';
-      drawText(g, `FIELDER ${side} - HIT ${gap}`, W / 2, H - 8, { color: C.yellow, align: 'center', outline: C.ink });
+      drawText(g, `DEEP FIELDER ${side} - HIT ${gap}`, W - 6, 6, { color: C.yellow, align: 'right', outline: C.ink });
     }
     if (this.balls < 2 && (this.state === 'runup' || this.state === 'flight')) {
       drawText(g, `< ${tapWord()} LEFT`, 6, 100, { color: this.hover < 0 ? C.yellow : C.white, outline: C.ink });
       drawText(g, `${tapWord()} RIGHT >`, W - 6, 100, { color: this.hover > 0 ? C.yellow : C.white, outline: C.ink, align: 'right' });
     }
+
+    // the bar slides up when the innings starts
+    const e = 1 - Math.pow(1 - this.barIn, 3);
+    const y = 146 + Math.round((1 - e) * 26);
+    const ballsLeft = TOTAL_BALLS - this.balls;
+    const need = Math.max(0, this.target - this.runs);
+
+    // tier 1 tabs: equation + speed gun
+    rect(g, 0, y - 9, 96, 9, 'rgba(11,10,30,0.94)');
+    rect(g, 0, y - 9, 3, 9, T.main);
+    drawText(g, need > 0 ? `TO WIN ${need} OFF ${ballsLeft}` : 'TARGET REACHED!', 6, y - 7, { color: C.yellow });
+    const showSpeed = this.state === 'flight' || this.state === 'hit' || this.state === 'result';
+    if (showSpeed) {
+      rect(g, 98, y - 9, 44, 9, 'rgba(11,10,30,0.94)');
+      drawText(g, `${this.del.speed} KM/H`, 120, y - 7, { color: C.white, align: 'center' });
+    }
+
+    // tier 2 main bar
+    rect(g, 0, y, W, 14, '#0B0A1E');
+    rect(g, 0, y, W, 1, T.main);
+    // batting team block
+    rect(g, 0, y + 1, 28, 13, T.main);
+    rect(g, 0, y + 1, 28, 1, shade(T.main, 1.3));
+    rect(g, 26, y + 1, 2, 13, T.trim);
+    drawText(g, T.code, 13, y + 5, { color: T.text, align: 'center' });
+    // score + overs
+    drawText(g, `${this.runs}-${this.wkts}`, 32, y + 3, { color: C.white, scale: 2 });
+    const ov = `${Math.floor(this.balls / 6)}.${this.balls % 6}`;
+    drawText(g, ov, 76, y + 3, { color: C.white });
+    drawText(g, `OF ${TOTAL_BALLS / 6}`, 76, y + 9, { color: C.grey });
+    const divider = (x: number) => rect(g, x, y + 3, 1, 9, '#2A2650');
+    divider(96);
+    // batter (striker *)
+    drawText(g, `NO.${this.shirtNumber()}*`, 100, y + 3, { color: C.white });
+    drawText(g, `${this.batRuns} (${this.batBalls})`, 100, y + 9, { color: C.yellow });
+    divider(138);
+    // bowler
+    drawText(g, this.bowler, 142, y + 3, { color: C.lavender });
+    drawText(g, `${this.bowlWkts}-${this.bowlRuns} (${this.bowlBalls})`, 142, y + 9, { color: C.white });
+    divider(186);
+    // opponent
+    drawText(g, 'VS', 190, y + 5, { color: C.grey });
+    rect(g, 200, y + 3, 28, 9, O.main);
+    rect(g, 200, y + 3, 28, 1, O.trim);
+    drawText(g, O.code, 214, y + 5, { color: O.text, align: 'center' });
+    divider(232);
+    // this over
+    drawText(g, 'THIS OVER', 236, y + 2, { color: C.grey });
+    const over = this.log.slice(this.overStart, this.overStart + 6);
+    for (let i = 0; i < 6; i++) {
+      const cx = 236 + i * 14, cy = y + 8;
+      const v = over[i];
+      const bg = v === undefined ? '#1A1838' : v === '6' ? C.pink : v === '4' ? C.blue : v === 'W' ? C.red : v === '.' ? '#2A2650' : '#3A3460';
+      rect(g, cx, cy, 12, 6, bg);
+      if (v !== undefined) drawText(g, v === '.' ? '0' : v, cx + 6, cy + 1, { color: v === '.' ? C.grey : C.white, align: 'center' });
+    }
+  }
+
+  private drawTeams(g: CanvasRenderingContext2D) {
+    dim(g, 0.45);
+    panel(g, 40, 12, 240, 136);
+    drawText(g, 'CRICKET CHASE', W / 2, 19, { color: C.yellow, scale: 2, align: 'center', outline: C.ink });
+    drawText(g, 'PICK YOUR TEAM', W / 2, 34, { color: C.lavender, align: 'center' });
+    TEAMS.forEach((t, i) => {
+      const { cx, top } = teamCell(i);
+      const sel = i === this.teamSel;
+      if (sel) {
+        rect(g, cx - 19, top - 3, 38, 29, 'rgba(255,194,26,0.16)');
+        rect(g, cx - 19, top - 3, 38, 1, C.yellow); rect(g, cx - 19, top + 25, 38, 1, C.yellow);
+      }
+      drawBadge(g, cx - 11, top + (sel && Math.floor(this.time * 5) % 2 ? -1 : 0), t);
+    });
+    const t = TEAMS[this.teamSel];
+    rect(g, 52, 117, 216, 9, t.main);
+    rect(g, 52, 117, 216, 1, t.trim);
+    drawText(g, t.name, W / 2, 119, { color: t.text, align: 'center' });
+    blinkText(g, `${tapWord()} A TEAM`, W / 2, 132, this.time);
+    drawText(g, input.touch ? 'OR D-PAD + A' : 'OR ARROWS + ENTER', W / 2, 140, { color: C.grey, align: 'center' });
   }
 
   private drawTitle(g: CanvasRenderingContext2D) {
     dim(g, 0.35);
-    panel(g, 62, 16, 196, 128);
-    drawText(g, 'CRICKET CHASE', W / 2, 24, { color: C.yellow, scale: 2, align: 'center', outline: C.ink });
-    drawText(g, 'TARGET', W / 2, 40, { color: C.lavender, align: 'center' });
-    drawText(g, String(this.target), W / 2, 47, { color: C.white, scale: 3, align: 'center', outline: C.pink });
-    drawText(g, `${TOTAL_BALLS} BALLS  -  ${MAX_WKTS} WICKETS`, W / 2, 67, { color: C.white, align: 'center' });
-    drawText(g, input.touch ? 'SWING: TAP LEFT/RIGHT HALF OR D-PAD' : 'SWING: CLICK LEFT/RIGHT HALF OR < >', W / 2, 76, { color: C.lavender, align: 'center' });
-    drawText(g, 'CHOOSE YOUR STANCE', W / 2, 89, { color: C.white, align: 'center' });
+    panel(g, 62, 14, 196, 130);
+    // back to team select
+    const b = BACK_BTN;
+    rect(g, b.x, b.y, b.w, b.h, C.purple);
+    rect(g, b.x, b.y + b.h - 1, b.w, 1, C.violet);
+    drawText(g, '< TEAM', b.x + b.w / 2, b.y + 3, { color: C.lavender, align: 'center' });
+    // fixture
+    drawBadge(g, 119, 19, this.T);
+    drawText(g, 'VS', W / 2, 26, { color: C.yellow, align: 'center' });
+    drawBadge(g, 179, 19, this.O);
+    drawText(g, `${this.T.code} NEED`, W / 2 - 20, 46, { color: C.lavender, align: 'right' });
+    drawText(g, String(this.target), W / 2, 44, { color: C.white, scale: 2, align: 'center', outline: C.pink });
+    drawText(g, `TO WIN`, W / 2 + 20, 46, { color: C.lavender });
+    drawText(g, `${TOTAL_BALLS} BALLS  -  ${MAX_WKTS} WICKETS  -  VS ${this.O.code}`, W / 2, 60, { color: C.white, align: 'center' });
+    // difficulty
+    drawText(g, 'LEVEL', 88, 74, { color: C.lavender, align: 'right' });
+    LEVEL_BTNS.forEach((b, i) => {
+      const Lv = LEVELS[i];
+      const sel = i === this.level;
+      rect(g, b.x, b.y, b.w, b.h, sel ? 'rgba(255,194,26,0.16)' : C.purple);
+      const edge = sel ? Lv.color : C.violet;
+      rect(g, b.x, b.y, b.w, 1, edge); rect(g, b.x, b.y + b.h - 1, b.w, 1, edge);
+      rect(g, b.x, b.y, 1, b.h, edge); rect(g, b.x + b.w - 1, b.y, 1, b.h, edge);
+      drawText(g, Lv.label, b.x + b.w / 2, b.y + 4, { color: sel ? Lv.color : C.grey, align: 'center' });
+    });
+    drawText(g, 'CHOOSE YOUR STANCE', W / 2, 86, { color: C.white, align: 'center' });
     STANCE_BTNS.forEach((b, i) => {
       const sel = i === this.stanceSel;
       rect(g, b.x, b.y, b.w, b.h, sel ? 'rgba(255,194,26,0.2)' : C.purple);
@@ -641,22 +893,26 @@ export class Cricket implements Game {
       const bob = sel && Math.floor(this.time * 4) % 2 ? -1 : 0;
       drawText(g, b.label, b.x + b.w / 2, b.y + 5 + bob, { color: sel ? C.yellow : C.white, align: 'center' });
     });
-    blinkText(g, `${tapWord()} A STANCE TO START`, W / 2, 120, this.time);
-    drawText(g, input.touch ? 'OR D-PAD < >  THEN  A' : 'OR < >  THEN  ENTER', W / 2, 130, { color: C.grey, align: 'center' });
+    blinkText(g, `${tapWord()} A STANCE TO START`, W / 2, 117, this.time);
+    drawText(g, input.touch ? 'D-PAD UP/DOWN LEVEL - < > STANCE - A START' : 'UP/DOWN LEVEL - < > STANCE - ENTER START', W / 2, 127, { color: C.grey, align: 'center' });
+    drawText(g, input.touch ? 'SWING: TAP LEFT/RIGHT HALF OR D-PAD' : 'SWING: CLICK LEFT/RIGHT HALF OR < >', W / 2, 136, { color: C.lavender, align: 'center' });
   }
 
   private drawOver(g: CanvasRenderingContext2D) {
     dim(g, 0.4);
     panel(g, 62, 30, 196, 96, this.won ? C.yellow : C.red);
-    drawText(g, this.won ? 'YOU WON!' : this.wkts >= MAX_WKTS ? 'ALL OUT!' : 'SO CLOSE!', W / 2, 40, {
+    drawText(g, this.won ? `${this.T.code} WIN!` : this.wkts >= MAX_WKTS ? 'ALL OUT!' : 'SO CLOSE!', W / 2, 40, {
       color: this.won ? C.yellow : C.red, scale: 3, align: 'center', outline: C.ink,
     });
-    drawText(g, `${this.runs}/${this.wkts} FROM ${this.balls} BALLS`, W / 2, 64, { color: C.white, align: 'center' });
+    drawText(g, `${this.T.code} ${this.runs}-${this.wkts} FROM ${this.balls} BALLS`, W / 2, 64, { color: C.white, align: 'center' });
+    const margin = this.target - 1 - this.runs;
     const msg = this.won
-      ? `CHASED ${this.target} WITH ${TOTAL_BALLS - this.balls} BALLS SPARE`
-      : `FELL SHORT BY ${this.target - this.runs} RUNS`;
+      ? `BEAT ${this.O.code} WITH ${TOTAL_BALLS - this.balls} BALLS SPARE`
+      : margin > 0 ? `${this.O.code} WIN BY ${margin} RUN${margin === 1 ? '' : 'S'}` : 'MATCH TIED!';
     drawText(g, msg, W / 2, 74, { color: C.lavender, align: 'center' });
-    if (this.t > 0.8) blinkText(g, `${tapWord()} TO PLAY AGAIN`, W / 2, 100, this.time);
-    drawText(g, 'NEW TARGET (UP TO 80) EVERY GAME', W / 2, 110, { color: C.grey, align: 'center' });
+    drawText(g, `${this.L.label} LEVEL`, W / 2, 84, { color: this.L.color, align: 'center' });
+    if (this.won && this.level === 0) drawText(g, 'TRY INTERMEDIATE NEXT?', W / 2, 92, { color: C.lavender, align: 'center' });
+    if (this.t > 0.8) blinkText(g, `${tapWord()} TO PLAY AGAIN`, W / 2, 102, this.time);
+    drawText(g, 'NEW OPPONENT AND TARGET EVERY GAME', W / 2, 112, { color: C.grey, align: 'center' });
   }
 }

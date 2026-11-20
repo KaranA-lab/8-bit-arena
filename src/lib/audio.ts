@@ -9,6 +9,8 @@ class Sfx {
   private master: GainNode | null = null;
   private noiseBuf: AudioBuffer | null = null;
   private lastPlay: Record<string, number> = {};
+  private crowdBuf: AudioBuffer | null = null;
+  private crowd: { sources: AudioScheduledSourceNode[]; out: GainNode } | null = null;
   muted = false;
 
   constructor() {
@@ -78,6 +80,127 @@ class Sfx {
     src.connect(filt).connect(gain).connect(master);
     src.start(t0, Math.random() * 0.5);
     src.stop(t0 + dur + 0.05);
+  }
+
+  // ---------- stadium crowd bed (cricket + football) ----------
+  /** Smooth "brown" noise, 4s long, with a crossfaded loop point so it never clicks. */
+  private makeCrowdBuffer(ctx: AudioContext) {
+    const len = ctx.sampleRate * 4;
+    const b = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = b.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) { last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02; d[i] = last * 3.5; }
+    const fade = Math.floor(ctx.sampleRate * 0.25);
+    for (let i = 0; i < fade; i++) { const k = i / fade; d[len - fade + i] = d[len - fade + i] * (1 - k) + d[i] * k; }
+    return b;
+  }
+
+  /** Quiet background murmur of a crowd, with slow swells. Safe to call repeatedly. */
+  startCrowd(level = 0.012) {
+    const ctx = this.ctx, master = this.master;
+    if (!ctx || !master || this.crowd || !this.noiseBuf) return;
+    if (!this.crowdBuf) this.crowdBuf = this.makeCrowdBuffer(ctx);
+    const now = ctx.currentTime;
+    const out = ctx.createGain();
+    out.gain.setValueAtTime(0.0001, now);
+    out.gain.exponentialRampToValueAtTime(1, now + 2);
+    out.connect(master);
+    // low rumble of thousands of voices
+    const rumble = ctx.createBufferSource();
+    rumble.buffer = this.crowdBuf; rumble.loop = true;
+    const rbp = ctx.createBiquadFilter(); rbp.type = 'bandpass'; rbp.frequency.value = 480; rbp.Q.value = 0.55;
+    const rg = ctx.createGain(); rg.gain.value = level;
+    rumble.connect(rbp).connect(rg).connect(out);
+    // a thin layer of chatter on top
+    const chatter = ctx.createBufferSource();
+    chatter.buffer = this.noiseBuf; chatter.loop = true;
+    const cbp = ctx.createBiquadFilter(); cbp.type = 'bandpass'; cbp.frequency.value = 1300; cbp.Q.value = 1.1;
+    const cg = ctx.createGain(); cg.gain.value = level * 0.06;
+    chatter.connect(cbp).connect(cg).connect(out);
+    // slow swells, like a stadium breathing
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 0.09;
+    const lfoAmt = ctx.createGain(); lfoAmt.gain.value = level * 0.35;
+    lfo.connect(lfoAmt).connect(rg.gain);
+    const lfo2 = ctx.createOscillator(); lfo2.frequency.value = 0.23;
+    const lfo2Amt = ctx.createGain(); lfo2Amt.gain.value = level * 0.025;
+    lfo2.connect(lfo2Amt).connect(cg.gain);
+    const sources = [rumble, chatter, lfo, lfo2];
+    sources.forEach((s) => s.start(now, s instanceof AudioBufferSourceNode ? Math.random() * 3 : 0));
+    this.crowd = { sources, out };
+  }
+
+  stopCrowd() {
+    const ctx = this.ctx, c = this.crowd;
+    if (!ctx || !c) return;
+    this.crowd = null;
+    const now = ctx.currentTime;
+    c.out.gain.cancelScheduledValues(now);
+    c.out.gain.setTargetAtTime(0.0001, now, 0.2);
+    c.sources.forEach((s) => { try { s.stop(now + 1); } catch { /* already stopped */ } });
+  }
+
+  /**
+   * Stadium roar for a boundary: a swell of voices (wobbling like thousands of people
+   * shouting), scattered applause, and on big moments a couple of whistles. The background
+   * crowd bed swells with it. intensity: ~0.7 for a four, 1 for a six.
+   */
+  roar(intensity = 1) {
+    const ctx = this.ctx, master = this.master;
+    if (!ctx || !master || !this.noiseBuf || this.muted) return;
+    if (!this.crowdBuf) this.crowdBuf = this.makeCrowdBuffer(ctx);
+    const t0 = ctx.currentTime;
+    const dur = 1.6 + intensity * 1.3;
+    const voices = (buf: AudioBuffer, freq: number, q: number, peak: number, wobbleHz: number) => {
+      const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+      const f = ctx.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = q;
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t0);
+      env.gain.exponentialRampToValueAtTime(peak, t0 + 0.3);
+      env.gain.setValueAtTime(peak, t0 + dur * 0.45);
+      env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      const wob = ctx.createGain(); wob.gain.value = 1;
+      const lfo = ctx.createOscillator(); lfo.frequency.value = wobbleHz;
+      const depth = ctx.createGain(); depth.gain.value = 0.28;
+      lfo.connect(depth).connect(wob.gain);
+      src.connect(f).connect(env).connect(wob).connect(master);
+      src.start(t0, Math.random() * 2); src.stop(t0 + dur + 0.1);
+      lfo.start(t0); lfo.stop(t0 + dur + 0.1);
+    };
+    voices(this.crowdBuf, 620, 0.5, 0.11 * intensity, 5.3);  // the big "ohhh / yeahhh"
+    voices(this.noiseBuf, 1450, 0.9, 0.05 * intensity, 8.7); // brighter shouting on top
+    // applause: lots of little claps scattered through the roar
+    const claps = Math.round(12 + 16 * intensity);
+    for (let i = 0; i < claps; i++) {
+      this.noise(0.03, { vol: 0.035 * intensity, freq: 1800 + Math.random() * 1800, q: 1.3, delay: 0.12 + Math.random() * dur * 0.75, attack: 0.002 });
+    }
+    // a couple of fans whistling for the big ones
+    if (intensity > 0.85) {
+      for (let i = 0; i < 2; i++) {
+        const at = t0 + 0.25 + Math.random() * 0.9;
+        const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = 2400 + Math.random() * 500;
+        const vib = ctx.createOscillator(); vib.frequency.value = 13; const vibAmt = ctx.createGain(); vibAmt.gain.value = 90;
+        vib.connect(vibAmt).connect(o.frequency);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.03, at + 0.04); g.gain.exponentialRampToValueAtTime(0.0001, at + 0.45);
+        o.connect(g).connect(master);
+        o.start(at); o.stop(at + 0.5); vib.start(at); vib.stop(at + 0.5);
+      }
+    }
+    // the background crowd swells up with it, then settles
+    const c = this.crowd;
+    if (c) {
+      c.out.gain.cancelScheduledValues(t0);
+      c.out.gain.setTargetAtTime(1 + 1.6 * intensity, t0, 0.12);
+      c.out.gain.setTargetAtTime(1, t0 + dur * 0.6, 0.7);
+    }
+  }
+
+  /** Lower the crowd while the menu is open / the game is paused. */
+  duckCrowd(duck: boolean) {
+    const ctx = this.ctx, c = this.crowd;
+    if (!ctx || !c) return;
+    c.out.gain.cancelScheduledValues(ctx.currentTime);
+    c.out.gain.setTargetAtTime(duck ? 0.25 : 1, ctx.currentTime, 0.25);
   }
 
   private arp(notes: number[], step: number, o: ToneOpts = {}) {
@@ -159,6 +282,8 @@ class Sfx {
       case 'win': this.arp([523, 659, 784, 659, 784, 1046], 0.11, { vol: 0.08 }); break;
       case 'lose': this.arp([392, 330, 262, 196], 0.16, { type: 'triangle', vol: 0.16 }); break;
       case 'jump': this.tone(300, 0.12, { vol: 0.06, slide: 700 }); break;
+      // knees skidding across the turf
+      case 'slide': this.noise(0.5, { vol: 0.1, freq: 1600, slide: 380, q: 0.6, attack: 0.02 }); break;
     }
   }
 }
@@ -168,6 +293,6 @@ export type SoundName =
   | 'bat' | 'swing' | 'bounce' | 'stumps' | 'cheer' | 'groan' | 'six' | 'four' | 'run' | 'out'
   | 'whistle' | 'kick' | 'goal' | 'save' | 'post'
   | 'putt' | 'wall' | 'sink' | 'splash'
-  | 'smash' | 'shuttle' | 'point' | 'lose-point' | 'win' | 'lose' | 'jump';
+  | 'smash' | 'shuttle' | 'point' | 'lose-point' | 'win' | 'lose' | 'jump' | 'slide';
 
 export const sfx = new Sfx();

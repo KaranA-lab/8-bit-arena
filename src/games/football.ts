@@ -1,7 +1,7 @@
 import { W, H, type Game, rect, px, line, Particles, Pops, Stands, floodlight, stars, shirt } from '../lib/gfx';
 import { drawText, measure } from '../lib/font';
 import { panel, blinkText, dim } from '../lib/ui';
-import { C, clamp, lerp, randi, chance, pick, easeOut } from '../lib/util';
+import { C, clamp, lerp, randi, chance, pick, easeOut, shade } from '../lib/util';
 import { sfx } from '../lib/audio';
 import { tapWord, input } from '../lib/input';
 import { updateRecords } from '../lib/records';
@@ -31,6 +31,15 @@ const ROWS = [59, 71];
 const KICK_START = { x: 136, y: 152 };
 const KICK_END = { x: 150, y: 124 };
 const KEEPER_NEON = '#B6F23A';
+const HAIR = '#2A1A10';
+const MOUTH = '#5A1A2A';
+
+/** Goal celebrations: the scorer peels away to a corner, then does one of these. */
+type CelebStyle = 'slide' | 'plane' | 'jump';
+const CELEBS: CelebStyle[] = ['slide', 'plane', 'jump'];
+const CELEB_DELAY = 0.15; // reacts once the net ripples
+const GOAL_HOLD = 2.7; // result screen after a goal (other outcomes: 1.7s)
+interface Pose { x: number; y: number; lift: number; face: number; kind: 'run' | 'slide' | 'kneel' | 'jump' | 'wings'; ph: number; tilt: number }
 
 const BALL6 = ['.WWWW.', 'WWKWWW', 'WKKKWW', 'WWKWWK', 'WWWWKW', '.WWWW.'];
 const BALL6B = ['.WWWW.', 'WWWKWW', 'WWKKKW', 'KWWKWW', 'WKWWWW', '.WWWW.'];
@@ -67,13 +76,18 @@ export class Football implements Game {
   pops = new Pops();
   netCache: HTMLCanvasElement;
   spin = 0;
+  celeb: { style: CelebStyle; dir: number; t: number; tx: number; ty: number } | null = null;
+  lastCeleb: CelebStyle | null = null;
 
   constructor() {
     this.stands = this.makeStands();
     this.netCache = document.createElement('canvas');
     this.netCache.width = W; this.netCache.height = H;
     this.paintNet(this.netCache.getContext('2d')!, null);
+    sfx.startCrowd();
   }
+
+  destroy() { sfx.stopCrowd(); }
 
   private get kit() { return KITS[this.userKit]; }
   private get opp() { return KITS[this.oppKit]; }
@@ -117,7 +131,7 @@ export class Football implements Game {
 
   private toSetup() {
     this.state = 'setup'; this.t = 0;
-    this.seg2 = null; this.ripple = null; this.userDive = null;
+    this.seg2 = null; this.ripple = null; this.userDive = null; this.celeb = null;
     this.keeperCol = 1; this.keeperRow = 1;
   }
 
@@ -166,14 +180,20 @@ export class Football implements Game {
     const userTurn = this.turn === 'user';
     (userTurn ? this.userRes : this.botRes).push(scored);
     switch (this.res) {
-      case 'goal':
+      case 'goal': {
         this.ripple = { x: this.tx, y: this.ty, t: 0 };
         this.seg2 = { fx: this.tx, fy: this.ty, tx: lerp(this.tx, 160, 0.1), ty: this.ty - 5, dur: 0.18, s0: 3, s1: 3, arc: 0, t: 0 };
         this.pops.add('GOAL!', { scale: 5, rainbow: userTurn, color: C.red, dur: 1.6 });
         sfx.play(userTurn ? 'goal' : 'groan');
-        if (userTurn) { sfx.play('cheer'); this.parts.confetti(110); this.stands.cheer(1); }
+        // the scorer wheels away to a corner and celebrates (never the same one twice running)
+        const style = pick(CELEBS.filter((s) => s !== this.lastCeleb));
+        const dir = chance(0.5) ? -1 : 1;
+        this.lastCeleb = style;
+        this.celeb = { style, dir, t: -CELEB_DELAY, tx: dir < 0 ? 50 : 270, ty: 142 };
+        if (userTurn) { sfx.play('cheer'); this.stands.cheer(1); }
         else this.stands.cheer(0.5);
         break;
+      }
       case 'saved': {
         const dir = this.tx < 160 ? -1 : this.tx > 160 ? 1 : chance(0.5) ? -1 : 1;
         this.seg2 = { fx: this.tx, fy: this.ty, tx: this.tx + dir * randi(36, 60), ty: randi(96, 120), dur: 0.55, s0: 3, s1: 5, arc: 10, t: 0 };
@@ -319,6 +339,16 @@ export class Football implements Game {
   update(dt: number) {
     this.t += dt; this.time += dt;
     this.stands.update(dt); this.parts.update(dt); this.pops.update(dt);
+    if (this.celeb) {
+      const was = this.celeb.t > 0 ? this.celebPose().kind : 'run';
+      this.celeb.t += dt;
+      const p = this.celebPose();
+      if (p.kind === 'slide') {
+        if (was !== 'slide') sfx.play('slide');
+        // turf spraying up behind the knees
+        if (p.ph < 0.85 && chance(0.7)) this.parts.burst(p.x - p.face * 5, p.y - 2, 1, { colors: ['#6FA27A', '#9BC79F', '#C9E3C4'], speed: 34, g: 90, life: 0.45, up: true });
+      }
+    }
     if (this.ripple) {
       this.ripple.t += dt;
       this.paintNet(this.netCache.getContext('2d')!, this.ripple.t < 0.6 ? this.ripple : null);
@@ -344,7 +374,7 @@ export class Football implements Game {
       case 'result':
         if (this.seg2) this.seg2.t += dt;
         this.spin += dt * 8;
-        if (this.t > 1.7) {
+        if (this.t > (this.res === 'goal' ? GOAL_HOLD : 1.7)) {
           if (this.winner) this.endMatch();
           else { this.turn = this.turn === 'user' ? 'bot' : 'user'; this.toSetup(); }
         }
@@ -520,6 +550,7 @@ export class Football implements Game {
 
   private drawKicker(g: CanvasRenderingContext2D) {
     const kit = this.turn === 'user' ? this.kit : this.opp;
+    if (this.celeb && this.celeb.t > 0 && (this.state === 'result' || this.state === 'over')) { this.drawScorer(g, kit); return; }
     let x = KICK_START.x, y = KICK_START.y;
     let phase: 'stand' | 'run1' | 'run2' | 'kick' = 'stand';
     if (this.state === 'runup') {
@@ -557,6 +588,177 @@ export class Football implements Game {
     rect(g, x - 1, y - 27, 3, 1, C.skin);
     rect(g, x - 3, y - 33, 7, 6, '#2A1A10');
     rect(g, x - 4, y - 30, 1, 2, C.skin); rect(g, x + 4, y - 30, 1, 2, C.skin);
+  }
+
+  // ---------------- goal celebration ----------------
+  /** Where the goal-scorer is and what he's doing, `celeb.t` seconds after the goal. */
+  private celebPose(): Pose {
+    const c = this.celeb!;
+    const t = Math.max(0, c.t);
+    const at = (p: number) => ({ x: lerp(KICK_END.x, c.tx, p), y: lerp(KICK_END.y, c.ty, p) });
+    const base = { lift: 0, face: c.dir, tilt: 0 };
+    if (c.style === 'slide') {
+      // sprint, drop to the knees and skid, then fist-pump on the turf
+      const RUN = 0.6, SLIDE = 0.55, P = 0.66;
+      if (t < RUN) { const u = t / RUN; return { ...base, ...at(P * (0.55 * u + 0.45 * u * u)), kind: 'run', ph: t * 3.6 }; }
+      if (t < RUN + SLIDE) { const v = (t - RUN) / SLIDE; return { ...base, ...at(P + (1 - P) * easeOut(v)), kind: 'slide', ph: v }; }
+      return { ...base, ...at(1), kind: 'kneel', ph: t - RUN - SLIDE };
+    }
+    if (c.style === 'jump') {
+      // sprint to the corner, turn to the camera and leap with both fists up
+      const RUN = 0.8;
+      if (t < RUN) { const u = t / RUN; return { ...base, ...at(u * (2 - u)), kind: 'run', ph: t * 3.6 }; }
+      const ph = ((t - RUN) / 0.55) % 1;
+      return { ...base, ...at(1), lift: ph < 0.72 ? Math.round(Math.sin((Math.PI * ph) / 0.72) * 8) : 0, kind: 'jump', ph };
+    }
+    // airplane: arms out like wings, wobbling along an S-curve, then banking in loops
+    const RUN = 1.1;
+    if (t < RUN) {
+      const p = Math.sin(((t / RUN) * Math.PI) / 2);
+      const pos = at(p);
+      return { ...base, x: pos.x, y: pos.y - Math.sin(p * Math.PI * 2) * 5, kind: 'wings', ph: t * 2.8, tilt: Math.sin(t * 6) * 0.8 };
+    }
+    const th = (t - RUN) * 3;
+    return { ...base, x: c.tx + Math.sin(th) * 11 * c.dir, y: c.ty - (1 - Math.cos(th)) * 3, kind: 'wings', ph: t * 2.8, tilt: -Math.sin(th) * c.dir };
+  }
+
+  private drawScorer(g: CanvasRenderingContext2D, kit: Kit) {
+    const p = this.celebPose();
+    const x = Math.round(p.x), y = Math.round(p.y);
+    if (p.kind === 'jump') {
+      const air = p.ph < 0.72;
+      this.drawFront(g, kit, x, y, p.lift, air ? (p.lift > 4 ? 'tuck' : 'stand') : 'crouch', air ? 'v' : 'flex', 0);
+    } else if (p.kind === 'wings') {
+      const step = Math.floor(p.ph * 2) % 2;
+      this.drawFront(g, kit, x, y, step, step ? 'run1' : 'run2', 'wings', Math.round(p.tilt * 3));
+    } else if (p.kind === 'kneel') {
+      // turned to the camera on his knees, fists pumping at the sky
+      this.drawFront(g, kit, x, y, 0, 'kneel', Math.floor(p.ph / 0.28) % 2 ? 'flex' : 'v', 0);
+    } else {
+      this.drawSide(g, kit, x, y, p);
+    }
+  }
+
+  /** Side-on scorer facing p.face (1 = right): sprinting or knee-sliding. */
+  private drawSide(g: CanvasRenderingContext2D, kit: Kit, x: number, y: number, p: Pose) {
+    const d = p.face;
+    const X = (ox: number) => x + d * ox;
+    const R = (ox: number, oy: number, w: number, h: number, c: string) => rect(g, d > 0 ? x + ox : x - ox - w + 1, y + oy, w, h, c);
+    const run = p.kind === 'run';
+    const q = Math.floor(p.ph * 8) / 8; // 8-frame run cycle
+    const bob = run && Math.floor(q * 4) % 2 ? -1 : 0;
+    const top = (run ? 0 : 3) + bob; // kneeling drops the body 3px
+    const lean = run ? 1 : p.kind === 'slide' ? -2 : -1; // sprinting leans in, celebrating leans back
+    const farSkin = shade(C.skin, 0.8), farSock = shade(kit.socks, 0.75), farMain = shade(kit.main, 0.75);
+
+    g.fillStyle = 'rgba(0,0,0,0.3)'; g.fillRect(x - 7, y - 1, 15, 2);
+
+    // arm: `a` is the upper-arm angle from straight down (+ = forward, PI = straight up)
+    const sx = lean, sy = -24 + top;
+    const arm = (a: number, bend: number, skin: string, sleeve: string) => {
+      const ex = sx + Math.sin(a) * 4, ey = sy + Math.cos(a) * 4;
+      const hx = ex + Math.sin(a + bend) * 4, hy = ey + Math.cos(a + bend) * 4;
+      line(g, X(sx), y + sy, X(ex), y + ey, skin, 2);
+      line(g, X(ex), y + ey, X(hx), y + hy, skin, 2);
+      line(g, X(sx), y + sy, X(sx + Math.sin(a) * 1.5), y + sy + Math.cos(a) * 1.5, sleeve, 2);
+    };
+    // running leg: thigh swings, knee folds on the recovery stroke
+    const leg = (ph: number, skin: string, sock: string) => {
+      const a = Math.PI * 2 * ph;
+      const th = 0.75 * Math.sin(a), bend = 0.25 + 1.2 * Math.max(0, Math.cos(a));
+      const hy = -12 + bob;
+      const kx = Math.sin(th) * 6, ky = hy + Math.cos(th) * 6;
+      const fx = kx + Math.sin(th - bend) * 5, fy = ky + Math.cos(th - bend) * 5;
+      line(g, X(0), y + hy, X(kx), y + ky, skin, 2);
+      line(g, X(kx), y + ky, X(fx), y + fy, sock, 2);
+      R(Math.round(fx) - 1, Math.round(fy) - 1, 3, 2, C.ink);
+    };
+    // kneeling leg: thigh down to the knee, shin flat on the turf behind
+    const kneelLeg = (o: number, skin: string, sock: string) => {
+      line(g, X(o), y - 9, X(o + 2), y - 2, skin, 2);
+      line(g, X(o + 2), y - 1, X(o - 4), y - 1, sock, 2);
+      R(o - 7, -2, 3, 2, C.ink);
+    };
+
+    // arm angles for this pose: [far, near] as [angle, elbow bend]
+    let far: [number, number], near: [number, number];
+    if (run) {
+      far = [0.9 * Math.sin(Math.PI * 2 * q), 1.4];
+      near = [0.9 * Math.sin(Math.PI * 2 * (q + 0.5)), 1.4];
+    } else {
+      far = [Math.PI + 0.8, 0]; near = [Math.PI + 1.2, 0]; // flung out behind, chest out
+    }
+
+    arm(far[0], far[1], farSkin, farMain);
+    if (run) { leg(q + 0.5, farSkin, farSock); leg(q, C.skin, kit.socks); }
+    else { kneelLeg(-1, farSkin, farSock); kneelLeg(0, C.skin, kit.socks); }
+    // kit
+    R(-3, -15 + top, 7, 4, kit.shorts);
+    R(-3, -20 + top, 7, 5, kit.main);
+    R(-3 + lean, -26 + top, 7, 6, kit.main);
+    if (kit.stripe) for (const s of [-2, 1]) { R(s, -20 + top, 1, 5, kit.stripe); R(s + lean, -26 + top, 1, 6, kit.stripe); }
+    R(-3, -20 + top, 2, 5, 'rgba(0,0,0,0.18)');
+    R(-3 + lean, -26 + top, 2, 6, 'rgba(0,0,0,0.18)');
+    R(-3 + lean, -26 + top, 7, 1, kit.trim);
+    // head, shouting
+    const hx = -2 + lean, hy = -33 + top;
+    R(lean, -27 + top, 2, 1, C.skin);
+    R(hx, hy, 6, 6, C.skin);
+    R(hx, hy, 6, 2, HAIR);
+    R(hx, hy + 2, 2, 2, HAIR);
+    R(hx + 6, hy + 3, 1, 1, C.skin);
+    R(hx + 4, hy + 2, 1, 1, C.ink);
+    R(hx + 4, hy + 4, 2, 1, MOUTH);
+    arm(near[0], near[1], C.skin, kit.main);
+  }
+
+  /** Front-on scorer (facing the camera): leaping, crouching or "flying" with arms out. */
+  private drawFront(
+    g: CanvasRenderingContext2D, kit: Kit, x: number, gy: number, lift: number,
+    legs: 'stand' | 'tuck' | 'crouch' | 'kneel' | 'run1' | 'run2', arms: 'v' | 'flex' | 'wings', tilt: number,
+  ) {
+    const sw = Math.max(7, 14 - lift);
+    g.fillStyle = 'rgba(0,0,0,0.3)'; g.fillRect(x - Math.floor(sw / 2), gy - 1, sw, 2);
+    const y = gy - lift;
+    const c = legs === 'crouch' ? 2 : legs === 'kneel' ? 4 : 0; // how far the body sinks
+    const leg = (lx: number, up: number, len: number) => {
+      rect(g, lx, y - len - up, 3, len - 6, C.skin);
+      rect(g, lx, y - 6 - up, 3, 4, kit.socks);
+      rect(g, lx, y - 2 - up, 3, 2, C.ink);
+    };
+    if (legs === 'tuck') { leg(x - 4, 3, 9); leg(x + 1, 3, 9); }
+    else if (legs === 'run1') { leg(x - 4, 2, 12); leg(x + 1, 0, 12); }
+    else if (legs === 'run2') { leg(x - 4, 0, 12); leg(x + 1, 2, 12); }
+    else if (legs === 'kneel') {
+      // thighs down to grass-stained knees; shins and boots tucked out of sight behind
+      for (const lx of [x - 4, x + 1]) { rect(g, lx, y - 8, 3, 7, C.skin); rect(g, lx, y - 1, 3, 1, shade(C.skin, 0.72)); }
+    } else { leg(x - 4, 0, 12 - c); leg(x + 1, 0, 12 - c); }
+    const b = y + c;
+    rect(g, x - 5, b - 15, 10, 4, kit.shorts);
+    rect(g, x - 6, b - 26, 12, 11, kit.main);
+    if (kit.stripe) for (let sx = x - 5; sx < x + 6; sx += 3) rect(g, sx, b - 26, 1, 11, kit.stripe);
+    rect(g, x + 3, b - 26, 3, 11, 'rgba(0,0,0,0.2)');
+    rect(g, x - 6, b - 26, 12, 1, kit.trim);
+    // v-neck + crest
+    rect(g, x - 1, b - 25, 2, 1, C.skin);
+    px(g, x - 2, b - 25, kit.trim); px(g, x + 1, b - 25, kit.trim); rect(g, x - 1, b - 24, 2, 1, kit.trim);
+    rect(g, x + 2, b - 22, 2, 2, kit.trim);
+    // arms
+    const limb = (x0: number, y0: number, x1: number, y1: number) => line(g, x0, y0, x1, y1, C.skin, 2);
+    const sy = b - 24;
+    if (arms === 'v') { limb(x - 7, sy, x - 11, b - 35); limb(x + 7, sy, x + 11, b - 35); }
+    else if (arms === 'flex') {
+      limb(x - 7, sy, x - 11, b - 21); limb(x - 11, b - 21, x - 10, b - 29);
+      limb(x + 7, sy, x + 11, b - 21); limb(x + 11, b - 21, x + 10, b - 29);
+    } else { limb(x - 7, sy, x - 17, sy - tilt); limb(x + 7, sy, x + 17, sy + tilt); }
+    rect(g, x - 8, b - 26, 2, 2, kit.main); rect(g, x + 6, b - 26, 2, 2, kit.main);
+    // head, shouting
+    rect(g, x - 1, b - 27, 3, 1, C.skin);
+    rect(g, x - 3, b - 33, 7, 6, C.skin);
+    rect(g, x - 3, b - 33, 7, 2, HAIR);
+    px(g, x - 3, b - 31, HAIR); px(g, x + 3, b - 31, HAIR);
+    px(g, x - 2, b - 30, C.ink); px(g, x + 2, b - 30, C.ink);
+    rect(g, x - 1, b - 29, 3, 2, MOUTH);
   }
 
   private drawReticle(g: CanvasRenderingContext2D) {

@@ -11,6 +11,13 @@ export const easeInOut = (t: number) => {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 };
 
+/** Darken (f < 1) or lighten (f > 1) a #RRGGBB colour. */
+export function shade(hex: string, f: number) {
+  const n = parseInt(hex.slice(1), 16);
+  const ch = (v: number) => Math.max(0, Math.min(255, Math.round(v * f))).toString(16).padStart(2, '0');
+  return `#${ch((n >> 16) & 255)}${ch((n >> 8) & 255)}${ch(n & 255)}`;
+}
+
 /** Small seeded PRNG so golf courses can be regenerated from their number. */
 export function mulberry32(seed: number) {
   let a = seed >>> 0;
